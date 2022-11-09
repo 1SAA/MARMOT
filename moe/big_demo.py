@@ -22,9 +22,20 @@ from transformers.modeling_utils import no_init_weights
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 import gc, sys, os
-from titans.loss.lm_loss import GPTLMLoss
-from titans.model.moe import prmoe_4b, prmoe_16b, prmoe_31b
-from utils import process_moe_model
+from titans.model.moe import prmoe_4b, prmoe_16b, prmoe_25b, prmoe_31b
+from utils import process_moe_model, LargeCrossEntropyLoss
+
+
+class GPTLMLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = LargeCrossEntropyLoss()
+
+    def forward(self, logits, labels):
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        return self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
 
 def get_data(batch_size, seq_len, vocab_size):
@@ -34,11 +45,11 @@ def get_data(batch_size, seq_len, vocab_size):
 
 
 def get_cpu_mem():
-    return psutil.Process().memory_info().rss / 1024**2
+    return psutil.Process().memory_info().rss / 1024 ** 2
 
 
 def get_gpu_mem():
-    return torch.cuda.max_memory_allocated() / 1024**2
+    return torch.cuda.max_memory_allocated() / 1024 ** 2
 
 
 def get_cur_gpu_mem():
@@ -56,8 +67,8 @@ def get_tflops(model_numel, batch_size, seq_len, step_time):
 
 
 def main():
-    BATCH_SIZE = 40
-    SEQ_LEN = 1024
+    BATCH_SIZE = 28
+    SEQ_LEN = 2048
     VOCAB_SIZE = 50257
     NUM_STEPS = 6
     PLACEMENT_POLICY = 'const'
@@ -70,7 +81,8 @@ def main():
     logger.info(get_mem_info(), ranks=[0])
     # build PR-MOE model
     with ColoInitContext(device=get_current_device()):
-        model = prmoe_16b(use_residual=True, checkpoint=True)
+        model = prmoe_31b(use_residual=True, checkpoint=True,
+                          vocab_size=VOCAB_SIZE, max_position_embeddings=2048)
     numel = process_moe_model(model)
     logger.info(f'Model numel: {numel}', ranks=[0])
     logger.info(get_mem_info(), ranks=[0])
@@ -93,14 +105,14 @@ def main():
         config_dict,
         init_device=torch.device('cpu'))
     gemini_manager = GeminiManager(PLACEMENT_POLICY, chunk_manager)
-    # gemini_manager._placement_policy.set_const_memory_boundary(1024 ** 3)
+    # gemini_manager._placement_policy.set_const_memory_boundary(1 * 1024)
     model = ZeroDDP(model, gemini_manager, pin_memory=True)
     logger.info(get_mem_info(prefix='After init model, '), ranks=[0])
     # logger.info(chunk_manager, ranks=[0])
     logger.info(get_mem_info(), ranks=[0])
 
     optimizer = HybridAdam(model.parameters(), lr=1e-3)
-    optimizer = ZeroOptimizer(optimizer, model, initial_scale=2**5, gpu_margin_mem_ratio=0.0)
+    optimizer = ZeroOptimizer(optimizer, model, initial_scale=2 ** 5, gpu_margin_mem_ratio=0.0)
 
     # build criterion
     criterion = MoeLoss(aux_weight=0.01, loss_fn=GPTLMLoss)
@@ -110,8 +122,9 @@ def main():
     #                        nvme_offload_dir='/data/user/offload')
     # optimizer = ZeroOptimizer(optimizer, model, initial_scale=2**5, gpu_margin_mem_ratio=0.0)
     # logger.info(get_mem_info(prefix='After init optim, '), ranks=[0])
-
     colo_set_process_memory_fraction(0.5)
+    torch.cuda.reset_max_memory_allocated()
+
     model.train()
 
     def one_turn():
@@ -132,7 +145,7 @@ def main():
 
         optimizer.step()
         dist.barrier()
-        logger.info(get_mem_info(prefix=f'[{n+1}/{NUM_STEPS}] Optimizer step '), ranks=[0])
+        logger.info(get_mem_info(prefix=f'[{n + 1}/{NUM_STEPS}] Optimizer step '), ranks=[0])
         optim_time = time() - bwd_end
         step_time = time() - start
         logger.info(
@@ -142,23 +155,22 @@ def main():
         torch.cuda.reset_max_memory_allocated()
 
     tflops_list = []
-    for n in range(NUM_STEPS):
-        one_turn()
-    tflops_list = tflops_list[1:]
-    tflops_list.sort()
-    mid_pos = NUM_STEPS // 2 - 1
-    logger.info("Profiling ended. The mode TFLOPS is {:.3f}".format(tflops_list[mid_pos]), ranks=[0])
+    # for n in range(NUM_STEPS):
+    #     one_turn()
+    # tflops_list = tflops_list[1:]
+    # tflops_list.sort()
+    # mid_pos = NUM_STEPS // 2 - 1
+    # logger.info("Profiling ended. The mode TFLOPS is {:.3f}".format(tflops_list[mid_pos]), ranks=[0])
 
-
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    #              schedule=schedule(wait=1, warmup=2, active=2),
-    #              on_trace_ready=tensorboard_trace_handler(
-    #                  f'prmoe-16b/update-{PLACEMENT_POLICY}-{dist.get_world_size()}gpu'),
-    #              record_shapes=True,
-    #              profile_memory=True) as prof:
-    #     for n in range(NUM_STEPS):
-    #         one_turn()
-    #         prof.step()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 schedule=schedule(wait=1, warmup=2, active=3),
+                 on_trace_ready=tensorboard_trace_handler(
+                     f'prmoe-29b/graph-{PLACEMENT_POLICY}-{dist.get_world_size()}gpu'),
+                 record_shapes=True,
+                 profile_memory=True) as prof:
+        for n in range(NUM_STEPS):
+            one_turn()
+            prof.step()
     dist.barrier()
 
 

@@ -4,9 +4,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from transformers import GPT2Config, GPT2LMHeadModel, AutoConfig, OPTForCausalLM
 
 import colossalai
-from colossalai.context import MOE_CONTEXT
 from colossalai.logging import disable_existing_loggers, get_dist_logger
 from colossalai.nn.optimizer import HybridAdam
 from colossalai.nn.loss import MoeLoss
@@ -22,20 +22,43 @@ from transformers.modeling_utils import no_init_weights
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 import gc, sys, os
-from titans.model.moe import prmoe_4b, prmoe_16b, prmoe_25b, prmoe_31b
-from utils import process_moe_model, LargeCrossEntropyLoss
+from utils import get_model_size
+
+
+class GPTLMModel(nn.Module):
+    def __init__(self, hidden_size=768, num_layers=12, num_attention_heads=12, max_seq_len=1024, vocab_size=50257,
+                 checkpoint=False):
+        super().__init__()
+        self.checkpoint = checkpoint
+        self.model = GPT2LMHeadModel(GPT2Config(n_embd=hidden_size, n_layer=num_layers,
+                                                n_head=num_attention_heads, n_positions=max_seq_len, n_ctx=max_seq_len,
+                                                vocab_size=vocab_size))
+        if checkpoint:
+            self.model.gradient_checkpointing_enable()
+
+    def forward(self, input_ids, attention_mask):
+        # Only return lm_logits
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=not self.checkpoint)[0]
 
 
 class GPTLMLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        self.loss_fn = LargeCrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss()
 
     def forward(self, logits, labels):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         # Flatten the tokens
         return self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+
+def gpt2_xl(checkpoint=True):
+    return GPTLMModel(hidden_size=1600, num_layers=48, num_attention_heads=32, checkpoint=checkpoint)
+
+
+def gpt2_21b(checkpoint=True):
+    return GPTLMModel(hidden_size=8192, num_layers=25, num_attention_heads=16, checkpoint=checkpoint)
 
 
 def get_data(batch_size, seq_len, vocab_size):
@@ -68,22 +91,20 @@ def get_tflops(model_numel, batch_size, seq_len, step_time):
 
 def main():
     BATCH_SIZE = 24
-    SEQ_LEN = 2048
+    SEQ_LEN = 1024
     VOCAB_SIZE = 50257
     NUM_STEPS = 6
-    PLACEMENT_POLICY = 'const'
+    PLACEMENT_POLICY = 'cpu'
 
     disable_existing_loggers()
     colossalai.launch_from_torch(config={})
     logger = get_dist_logger()
-
-    MOE_CONTEXT.setup(42)
     logger.info(get_mem_info(), ranks=[0])
-    # build PR-MOE model
+
+    # build GPT2 model
     with ColoInitContext(device=get_current_device()):
-        model = prmoe_16b(use_residual=True, checkpoint=True,
-                          vocab_size=VOCAB_SIZE, max_position_embeddings=2048)
-    numel = process_moe_model(model)
+        model = gpt2_21b(checkpoint=True)
+    numel = get_model_size(model)
     logger.info(f'Model numel: {numel}', ranks=[0])
     logger.info(get_mem_info(), ranks=[0])
     # logger.info([p.numel() for p in model.parameters()], ranks=[0])
@@ -93,8 +114,8 @@ def main():
     begin = time()
     config_dict = search_chunk_configuration(
         model=model,
-        search_range_mb=128,
-        search_interval_byte=2048,
+        search_range_mb=64,
+        search_interval_byte=8192,
         filter_exlarge_params=True
     )
     span = time() - begin
@@ -105,7 +126,7 @@ def main():
         config_dict,
         init_device=torch.device('cpu'))
     gemini_manager = GeminiManager(PLACEMENT_POLICY, chunk_manager)
-    gemini_manager._placement_policy.set_const_memory_boundary(3 * 1024)
+    # gemini_manager._placement_policy.set_const_memory_boundary(1024 ** 3)
     model = ZeroDDP(model, gemini_manager, pin_memory=True)
     logger.info(get_mem_info(prefix='After init model, '), ranks=[0])
     # logger.info(chunk_manager, ranks=[0])
@@ -115,16 +136,15 @@ def main():
     optimizer = ZeroOptimizer(optimizer, model, initial_scale=2 ** 5, gpu_margin_mem_ratio=0.0)
 
     # build criterion
-    criterion = MoeLoss(aux_weight=0.01, loss_fn=GPTLMLoss)
+    criterion = GPTLMLoss()
 
     # optimizer
     # optimizer = HybridAdam(model.parameters(), lr=1e-3, nvme_offload_fraction=0.0,
     #                        nvme_offload_dir='/data/user/offload')
     # optimizer = ZeroOptimizer(optimizer, model, initial_scale=2**5, gpu_margin_mem_ratio=0.0)
     # logger.info(get_mem_info(prefix='After init optim, '), ranks=[0])
-    colo_set_process_memory_fraction(0.5)
-    torch.cuda.reset_max_memory_allocated()
 
+    colo_set_process_memory_fraction(0.5)
     model.train()
 
     def one_turn():
@@ -165,7 +185,7 @@ def main():
     # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     #              schedule=schedule(wait=1, warmup=2, active=2),
     #              on_trace_ready=tensorboard_trace_handler(
-    #                  f'opt-6.7b/v3-full-{PLACEMENT_POLICY}-{dist.get_world_size()}gpu'),
+    #                  f'prmoe-16b/update-{PLACEMENT_POLICY}-{dist.get_world_size()}gpu'),
     #              record_shapes=True,
     #              profile_memory=True) as prof:
     #     for n in range(NUM_STEPS):

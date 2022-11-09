@@ -1,3 +1,4 @@
-export OMP_NUM_THREADS=16
-
-torchrun --nproc_per_node=2 --master_port=19198 small_demo.py
+export MY_NRPOC=${1:-1}
+MY_THREADS=$[128/${MY_NRPOC}]
+export OMP_NUM_THREADS=${MY_THREADS}
+torchrun --nproc_per_node=${MY_NRPOC} --master_port=19198 small_demo.py
